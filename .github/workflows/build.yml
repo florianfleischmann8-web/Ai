@@ -69,6 +69,7 @@ jobs:
               implementation("androidx.compose.foundation:foundation")
               implementation("androidx.compose.animation:animation")
               implementation("androidx.compose.material3:material3")
+              implementation("com.google.mlkit:image-labeling:17.0.9")
           }
           __NF_EOF__
           mkdir -p app/src/main
@@ -117,6 +118,7 @@ jobs:
           import kotlinx.coroutines.withContext
           import java.io.File
           import java.util.Random
+          import kotlin.math.max
           import kotlin.math.min
 
           class Msg(val id: Long, val fromUser: Boolean, val text: String? = null, val prompt: String = "") {
@@ -141,6 +143,7 @@ jobs:
               @Volatile private var latentsDirty = true
               @Volatile private var stopFlag = false
               private var idc = 0L
+              private var assoc: Map<String, List<Pair<String, Float>>> = emptyMap()
 
               val items = mutableStateListOf<Item>()
               val messages = mutableStateListOf<Msg>()
@@ -158,6 +161,7 @@ jobs:
 
               init {
                   items.addAll(store.load())
+                  refreshAssoc()
                   if (modelFile.exists()) {
                       val e = model.load(modelFile)
                       if (e >= 0) trainedEpochs = e else model = VAE()
@@ -182,22 +186,29 @@ jobs:
 
               fun addImages(uris: List<Uri>, tagText: String) {
                   val tags = Lang.tokens(tagText)
-                  if (tags.isEmpty()) { toast = "Bitte mindestens ein Stichwort angeben"; return }
                   viewModelScope.launch {
-                      val created = withContext(Dispatchers.IO) {
-                          uris.mapNotNull { u ->
-                              try { store.create(Pix.load(ctx, u), tags) } catch (e: Exception) { null }
-                          }
+                      var skipped = 0
+                      val created = ArrayList<Item>()
+                      for (u in uris) {
+                          val l = withContext(Dispatchers.IO) { try { Pix.load(ctx, u) } catch (e: Exception) { null } }
+                          if (l == null) { skipped++; continue }
+                          val auto = autoTokens(Vision.labels(l.large)).entries
+                              .sortedByDescending { it.value }.take(8).map { it.key to it.value }
+                          if (tags.isEmpty() && auto.isEmpty()) { skipped++; continue }
+                          created.add(withContext(Dispatchers.IO) { store.create(l.small, tags, auto) })
                       }
                       items.addAll(created)
                       withContext(Dispatchers.IO) { store.persist(items.toList()) }
+                      refreshAssoc()
                       latentsDirty = true
-                      toast = "${created.size} Bild(er) hinzugefügt – jetzt trainieren!"
+                      toast = "${created.size} Bild(er) gelernt & automatisch erkannt" +
+                          (if (skipped > 0) " ($skipped übersprungen)" else "") + " – jetzt trainieren!"
                   }
               }
 
               fun remove(item: Item) {
                   items.remove(item)
+                  refreshAssoc()
                   latentsDirty = true
                   viewModelScope.launch(Dispatchers.IO) {
                       store.remove(item)
@@ -218,7 +229,7 @@ jobs:
                   viewModelScope.launch(Dispatchers.Default) {
                       try {
                           val rnd = Random(System.nanoTime())
-                          val conds = snap.map { Lang.cond(it.tags) }
+                          val conds = snap.map { Lang.cond(it.weights()) }
                           val order = MutableList(snap.size) { it }
                           synchronized(lock) { model.prepTrain() }
                           val bs = 8
@@ -276,10 +287,18 @@ jobs:
                   val s = Cfg.S
                   val out = FloatArray(Cfg.D)
                   val flip = rnd.nextBoolean()
-                  val br = 1f + (rnd.nextFloat() - 0.5f) * 0.1f
+                  val br = 1f + (rnd.nextFloat() - 0.5f) * 0.14f
+                  val ct = 1f + (rnd.nextFloat() - 0.5f) * 0.2f
+                  val dx = rnd.nextInt(7) - 3
+                  val dy = rnd.nextInt(7) - 3
                   for (y in 0 until s) for (x in 0 until s) {
-                      val sx = if (flip) s - 1 - x else x
-                      for (ch in 0..2) out[(y * s + x) * 3 + ch] = (px[(y * s + sx) * 3 + ch] * br).coerceIn(0f, 1f)
+                      val sx0 = (x + dx).coerceIn(0, s - 1)
+                      val sy0 = (y + dy).coerceIn(0, s - 1)
+                      val sx = if (flip) s - 1 - sx0 else sx0
+                      for (ch in 0..2) {
+                          val q = px[(sy0 * s + sx) * 3 + ch]
+                          out[(y * s + x) * 3 + ch] = (((q - 0.5f) * ct + 0.5f) * br).coerceIn(0f, 1f)
+                      }
                   }
                   return out
               }
@@ -288,7 +307,74 @@ jobs:
                   val s = items.toList()
                   if (s.isEmpty()) return
                   val pick = s[Random().nextInt(s.size)]
-                  preview = generate(pick.tags.joinToString(" "), 0.2f, System.nanoTime()).big
+                  preview = generate((if (pick.tags.isNotEmpty()) pick.tags else pick.allTags).joinToString(" "), 0.2f, System.nanoTime()).big
+              }
+
+              // ---------------- Verstehen & Wort-Verknüpfungen ----------------
+
+              private fun autoTokens(labels: List<Pair<String, Float>>): Map<String, Float> {
+                  val m = HashMap<String, Float>()
+                  for ((text, c) in labels) for (t in Lang.tokens(text)) m[t] = max(m[t] ?: 0f, c)
+                  return m
+              }
+
+              /** Lernt aus allen Bildern, welche Wörter zusammen auftreten (P(b | a)). */
+              private fun refreshAssoc() {
+                  val snap = items.toList()
+                  val n = snap.size.coerceAtLeast(1)
+                  val cnt = HashMap<String, Int>()
+                  val co = HashMap<String, HashMap<String, Int>>()
+                  for (item in snap) {
+                      val t = item.allTags
+                      for (a in t) {
+                          cnt[a] = (cnt[a] ?: 0) + 1
+                          val m = co.getOrPut(a) { HashMap() }
+                          for (b in t) if (a != b) m[b] = (m[b] ?: 0) + 1
+                      }
+                  }
+                  val res = HashMap<String, List<Pair<String, Float>>>()
+                  for ((a, m) in co) {
+                      val ca = (cnt[a] ?: 1).toFloat()
+                      res[a] = m.entries.map { e ->
+                          val p = e.value / ca
+                          val generic = (cnt[e.key] ?: 1).toFloat() / n
+                          e.key to p * (1f - 0.6f * generic)
+                      }.sortedByDescending { it.second }.take(8)
+                  }
+                  assoc = res
+              }
+
+              private fun expand(toks: List<String>): Map<String, Float> {
+                  val w = HashMap<String, Float>()
+                  for (t in toks) w[t] = 1f
+                  for (t in toks) {
+                      for ((b, p) in assoc[t].orEmpty().take(6)) {
+                          if (b !in toks) w[b] = max(w[b] ?: 0f, 0.8f * p)
+                      }
+                  }
+                  return w
+              }
+
+              /** Bild aus dem Chat analysieren: Was sieht die KI, und was passt zu deinen Stichwörtern? */
+              fun describe(uri: Uri) {
+                  messages.add(Msg(nextId(), true, text = "📎 Was siehst du auf diesem Bild?"))
+                  viewModelScope.launch {
+                      val l = withContext(Dispatchers.IO) { try { Pix.load(ctx, uri) } catch (e: Exception) { null } }
+                      if (l == null) { reply("Das Bild konnte ich nicht laden."); return@launch }
+                      val labels = Vision.labels(l.large)
+                      if (labels.isEmpty()) { reply("Ich erkenne darauf nichts mit ausreichender Sicherheit."); return@launch }
+                      val toks = autoTokens(labels).keys.toList()
+                      val userWords = items.flatMap { it.tags }.toSet()
+                      val mine = (toks.filter { it in userWords } +
+                          toks.flatMap { assoc[it].orEmpty() }.filter { it.first in userWords }
+                              .sortedByDescending { it.second }.map { it.first }).distinct().take(4)
+                      val seen = labels.take(6).joinToString(", ") { "${it.first} (${(it.second * 100).toInt()}%)" }
+                      reply(
+                          "Ich sehe: $seen\n" +
+                              if (mine.isNotEmpty()) "Das verknüpfe ich mit deinen Stichwörtern: ${mine.joinToString(", ")}"
+                              else "Dazu kenne ich noch keine eigenen Stichwörter – lade ähnliche Bilder hoch und beschrifte sie."
+                      )
+                  }
               }
 
               // ---------------- Chat & Generierung ----------------
@@ -341,21 +427,22 @@ jobs:
               private fun refreshLatents(snap: List<Item>) {
                   if (!latentsDirty && snap.all { latents.containsKey(it.id) }) return
                   latents.clear()
-                  for (it0 in snap) latents[it0.id] = model.encodeMean(it0.px, Lang.cond(it0.tags))
+                  for (it0 in snap) latents[it0.id] = model.encodeMean(it0.px, Lang.cond(it0.weights()))
                   latentsDirty = false
               }
 
               private fun generate(prompt: String, variation: Float, seed: Long): Gen {
                   val toks = Lang.tokens(prompt)
-                  val c = Lang.cond(toks)
+                  val weights = expand(toks)
+                  val c = Lang.cond(weights)
                   val rnd = Random(seed)
                   val snap = items.toList()
-                  val known = snap.flatMap { it.tags }.toSet()
+                  val known = snap.flatMap { it.allTags }.toSet()
                   val z = FloatArray(Cfg.Z)
                   val pix = synchronized(lock) {
                       refreshLatents(snap)
-                      val matched = snap.map { it to it.tags.count { t -> t in toks } }
-                          .filter { it.second > 0 }.sortedByDescending { it.second }.map { it.first }
+                      val matched = snap.map { it to it.allTags.sumOf { t -> (weights[t] ?: 0f).toDouble() } }
+                          .filter { it.second > 0.0 }.sortedByDescending { it.second }.map { it.first }
                       val pool = (if (matched.isNotEmpty()) matched.take(8) else snap).toMutableList()
                       java.util.Collections.shuffle(pool, rnd)
                       val k = min(pool.size, 2 + rnd.nextInt(2))
@@ -379,8 +466,14 @@ jobs:
                   while (big.width < 384) big = Bitmap.createScaledBitmap(big, big.width * 2, big.height * 2, true)
                   val hit = toks.filter { it in known }
                   val unknown = toks.filter { it !in known }
+                  val related = weights.entries.filter { it.key !in toks && it.key in known }
+                      .sortedByDescending { it.value }.take(4).map { it.key }
                   val cap = buildString {
                       if (hit.isNotEmpty()) append("Konzepte: ${hit.joinToString(" + ")}")
+                      if (related.isNotEmpty()) {
+                          if (isNotEmpty()) append(" · ")
+                          append("Assoziiert: ${related.joinToString()}")
+                      }
                       if (unknown.isNotEmpty()) {
                           if (isNotEmpty()) append(" · ")
                           append("Unbekannt: ${unknown.joinToString()}")
@@ -423,8 +516,9 @@ jobs:
                   val tags = Lang.tokens(m.prompt)
                   if (tags.isEmpty()) { toast = "Keine Stichwörter im Prompt"; return }
                   viewModelScope.launch {
-                      val it0 = withContext(Dispatchers.IO) { store.create(small, tags) }
+                      val it0 = withContext(Dispatchers.IO) { store.create(small, tags, emptyList()) }
                       items.add(it0)
+                      refreshAssoc()
                       withContext(Dispatchers.IO) { store.persist(items.toList()) }
                       latentsDirty = true
                       m.learned = true
@@ -486,6 +580,7 @@ jobs:
           import java.util.Random
           import kotlin.math.exp
           import kotlin.math.ln
+          import kotlin.math.max
           import kotlin.math.pow
           import kotlin.math.sqrt
 
@@ -519,12 +614,16 @@ jobs:
                       .map { stem(it) }
                       .distinct()
 
-              fun cond(tokens: List<String>): FloatArray {
+              fun cond(tokens: List<String>): FloatArray = cond(tokens.associateWith { 1f })
+
+              fun cond(w: Map<String, Float>): FloatArray {
                   val v = FloatArray(Cfg.C)
-                  for (t in tokens) {
+                  for ((t, x) in w) {
                       val h = t.hashCode()
-                      v[Math.floorMod(h, Cfg.C)] = 1f
-                      v[Math.floorMod(h * -1640531527, Cfg.C)] = 1f
+                      val i1 = Math.floorMod(h, Cfg.C)
+                      val i2 = Math.floorMod(h * -1640531527, Cfg.C)
+                      v[i1] = max(v[i1], x)
+                      v[i2] = max(v[i2], x)
                   }
                   return v
               }
@@ -762,12 +861,23 @@ jobs:
           import kotlin.math.max
           import kotlin.math.min
 
-          class Item(val id: String, val tags: List<String>, val bmp: Bitmap) {
+          /** tags = deine Stichwörter, auto = von der KI selbst erkannte Begriffe mit Sicherheit. */
+          class Item(val id: String, val tags: List<String>, val auto: List<Pair<String, Float>>, val bmp: Bitmap) {
               val px: FloatArray = Pix.toFloats(bmp)
+              val allTags: List<String> = (tags + auto.map { it.first }).distinct()
+
+              fun weights(): Map<String, Float> {
+                  val w = HashMap<String, Float>()
+                  for ((t, c) in auto) w[t] = c.coerceIn(0.3f, 1f)
+                  for (t in tags) w[t] = 1f
+                  return w
+              }
           }
 
+          class Loaded(val small: Bitmap, val large: Bitmap)
+
           object Pix {
-              fun load(ctx: Context, uri: Uri): Bitmap {
+              fun load(ctx: Context, uri: Uri): Loaded {
                   val src = ImageDecoder.createSource(ctx.contentResolver, uri)
                   val bmp = ImageDecoder.decodeBitmap(src) { dec, info, _ ->
                       dec.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE)
@@ -776,7 +886,7 @@ jobs:
                       val sc = min(1f, 512f / max(w, h))
                       dec.setTargetSize(max(1, (w * sc).toInt()), max(1, (h * sc).toInt()))
                   }
-                  return prepare(bmp)
+                  return Loaded(prepare(bmp), bmp)
               }
 
               fun prepare(src: Bitmap): Bitmap {
@@ -818,9 +928,14 @@ jobs:
                           val id = o.getString("id")
                           val ta = o.getJSONArray("tags")
                           val tags = (0 until ta.length()).map { ta.getString(it) }
+                          val aa = o.optJSONArray("auto")
+                          val auto = if (aa == null) emptyList() else (0 until aa.length()).map {
+                              val ao = aa.getJSONObject(it)
+                              ao.getString("t") to ao.getDouble("c").toFloat()
+                          }
                           val bmp = BitmapFactory.decodeFile(File(dir, "$id.png").path) ?: continue
                           if (bmp.width != Cfg.S || bmp.height != Cfg.S) continue
-                          out.add(Item(id, tags, bmp))
+                          out.add(Item(id, tags, auto, bmp))
                       }
                   } catch (e: Exception) {
                   }
@@ -829,19 +944,22 @@ jobs:
 
               fun persist(items: List<Item>) {
                   val arr = JSONArray()
-                  for (it in items) {
+                  for (item in items) {
                       val o = JSONObject()
-                      o.put("id", it.id)
-                      o.put("tags", JSONArray(it.tags))
+                      o.put("id", item.id)
+                      o.put("tags", JSONArray(item.tags))
+                      val aa = JSONArray()
+                      for ((t, c) in item.auto) aa.put(JSONObject().put("t", t).put("c", c.toDouble()))
+                      o.put("auto", aa)
                       arr.put(o)
                   }
                   idx.writeText(arr.toString())
               }
 
-              fun create(bmp: Bitmap, tags: List<String>): Item {
+              fun create(bmp: Bitmap, tags: List<String>, auto: List<Pair<String, Float>>): Item {
                   val id = UUID.randomUUID().toString().replace("-", "")
                   FileOutputStream(File(dir, "$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                  return Item(id, tags, bmp)
+                  return Item(id, tags, auto, bmp)
               }
 
               fun remove(item: Item) {
@@ -1122,6 +1240,15 @@ jobs:
                   }
                   val inShape = RoundedCornerShape(26.dp)
                   Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      val attach = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                          if (uri != null) vm.describe(uri)
+                      }
+                      Box(
+                          Modifier.size(44.dp).clip(CircleShape).background(P.card2).border(1.dp, P.line, CircleShape)
+                              .clickable { attach.launch("image/*") },
+                          contentAlignment = Alignment.Center
+                      ) { T("📎", sz = 18) }
+                      Spacer(Modifier.width(8.dp))
                       Box(
                           Modifier.weight(1f).clip(inShape).background(P.card).border(1.dp, P.line, inShape)
                               .padding(horizontal = 16.dp, vertical = 13.dp)
@@ -1306,7 +1433,8 @@ jobs:
                                           contentAlignment = Alignment.Center
                                       ) { T("✕", Color.White, 11) }
                                   }
-                                  T(item.tags.joinToString(" · "), P.dim, 10)
+                                  if (item.tags.isNotEmpty()) T(item.tags.joinToString(" · "), P.dim, 10)
+                                  if (item.auto.isNotEmpty()) T("🤖 " + item.auto.take(4).joinToString(" · ") { it.first }, P.cyan, 9)
                               }
                           }
                       }
@@ -1331,7 +1459,7 @@ jobs:
                   title = { T("$count Bild(er) beschriften", sz = 18, w = FontWeight.Bold) },
                   text = {
                       Column {
-                          T("Stichwörter für alle gewählten Bilder (mit Leerzeichen oder Komma trennen):", P.dim, 13)
+                          T("Deine Stichwörter für alle gewählten Bilder (optional – die KI erkennt zusätzlich selbst, was darauf zu sehen ist):", P.dim, 13)
                           Spacer(Modifier.height(10.dp))
                           Box(Modifier.fillMaxWidth().clip(shape).background(P.card2).border(1.dp, P.line, shape).padding(12.dp)) {
                               if (tags.isEmpty()) T("z. B. sonnenuntergang rot meer", P.dim, 14)
@@ -1441,6 +1569,34 @@ jobs:
                       confirmButton = { Pill("Zurücksetzen", true) { vm.resetModel(); confirmReset = false } },
                       dismissButton = { Pill("Abbrechen") { confirmReset = false } }
                   )
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/Vision.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import android.graphics.Bitmap
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.label.ImageLabeling
+          import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlin.coroutines.resume
+
+          /** Erkennt on-device (Modell steckt in der APK, kein Internet, keine API), was auf einem Bild zu sehen ist. */
+          object Vision {
+              private val labeler by lazy {
+                  ImageLabeling.getClient(ImageLabelerOptions.Builder().setConfidenceThreshold(0.55f).build())
+              }
+
+              suspend fun labels(bmp: Bitmap): List<Pair<String, Float>> = suspendCancellableCoroutine { cont ->
+                  try {
+                      labeler.process(InputImage.fromBitmap(bmp, 0))
+                          .addOnSuccessListener { res -> cont.resume(res.map { it.text to it.confidence }) }
+                          .addOnFailureListener { cont.resume(emptyList()) }
+                  } catch (e: Exception) {
+                      cont.resume(emptyList())
+                  }
               }
           }
           __NF_EOF__
