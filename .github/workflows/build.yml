@@ -1,0 +1,1569 @@
+name: Build NeuroForge APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Projektdateien erzeugen (kompletter App-Code steckt in dieser Datei)
+        run: |
+          set -e
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__NF_EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.neuroforge.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.neuroforge.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+              packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.animation:animation")
+              implementation("androidx.compose.material3:material3")
+          }
+          __NF_EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__NF_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:largeHeap="true"
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/Theme.NeuroForge">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/AppVM.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import android.app.Application
+          import android.content.ContentValues
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import android.os.Environment
+          import android.provider.MediaStore
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.Random
+          import kotlin.math.min
+
+          class Msg(val id: Long, val fromUser: Boolean, val text: String? = null, val prompt: String = "") {
+              var stage by mutableStateOf("")
+              var image by mutableStateOf<Bitmap?>(null)
+              var revealed by mutableStateOf(false)
+              var learned by mutableStateOf(false)
+              var caption by mutableStateOf("")
+              var frames: List<Bitmap> = emptyList()
+              var small: Bitmap? = null
+          }
+
+          class Gen(val small: Bitmap, val big: Bitmap, val caption: String)
+
+          class AppVM(app: Application) : AndroidViewModel(app) {
+              private val ctx = app.applicationContext
+              private val store = Store(ctx)
+              private val modelFile = File(ctx.filesDir, "model.bin")
+              private val lock = Any()
+              private var model = VAE()
+              private val latents = HashMap<String, FloatArray>()
+              @Volatile private var latentsDirty = true
+              @Volatile private var stopFlag = false
+              private var idc = 0L
+
+              val items = mutableStateListOf<Item>()
+              val messages = mutableStateListOf<Msg>()
+              val lossHistory = mutableStateListOf<Float>()
+
+              var trainedEpochs by mutableStateOf(0)
+              var training by mutableStateOf(false)
+              var epoch by mutableStateOf(0)
+              var totalEp by mutableStateOf(0)
+              var loss by mutableStateOf(0f)
+              var preview by mutableStateOf<Bitmap?>(null)
+              var variation by mutableStateOf(0.35f)
+              var toast by mutableStateOf<String?>(null)
+              var draft by mutableStateOf("")
+
+              init {
+                  items.addAll(store.load())
+                  if (modelFile.exists()) {
+                      val e = model.load(modelFile)
+                      if (e >= 0) trainedEpochs = e else model = VAE()
+                  }
+                  reply(
+                      "Hi, ich bin NeuroForge ✦ – eine KI, die komplett auf diesem Handy läuft, ohne API.\n\n" +
+                          "1️⃣ Bibliothek: Bilder + Stichwörter hochladen\n" +
+                          "2️⃣ Training: Modell lernen lassen\n" +
+                          "3️⃣ Hier schreiben, z. B. „roter Sonnenuntergang“ – ich male jedes Bild neu, auch gemischt aus mehreren Konzepten.\n\n" +
+                          "Schreib „hilfe“ für mehr."
+                  )
+              }
+
+              private fun nextId() = idc++
+              private fun reply(t: String) { messages.add(Msg(nextId(), false, text = t)) }
+
+              fun topTags(n: Int): List<Pair<String, Int>> =
+                  items.flatMap { it.tags }.groupingBy { it }.eachCount().entries
+                      .sortedByDescending { it.value }.take(n).map { it.key to it.value }
+
+              // ---------------- Bibliothek ----------------
+
+              fun addImages(uris: List<Uri>, tagText: String) {
+                  val tags = Lang.tokens(tagText)
+                  if (tags.isEmpty()) { toast = "Bitte mindestens ein Stichwort angeben"; return }
+                  viewModelScope.launch {
+                      val created = withContext(Dispatchers.IO) {
+                          uris.mapNotNull { u ->
+                              try { store.create(Pix.load(ctx, u), tags) } catch (e: Exception) { null }
+                          }
+                      }
+                      items.addAll(created)
+                      withContext(Dispatchers.IO) { store.persist(items.toList()) }
+                      latentsDirty = true
+                      toast = "${created.size} Bild(er) hinzugefügt – jetzt trainieren!"
+                  }
+              }
+
+              fun remove(item: Item) {
+                  items.remove(item)
+                  latentsDirty = true
+                  viewModelScope.launch(Dispatchers.IO) {
+                      store.remove(item)
+                      store.persist(items.toList())
+                  }
+              }
+
+              // ---------------- Training ----------------
+
+              fun startTraining(epochs: Int) {
+                  if (training) return
+                  if (items.isEmpty()) { toast = "Lade zuerst Bilder in der Bibliothek hoch"; return }
+                  stopFlag = false
+                  training = true
+                  totalEp = epochs
+                  epoch = 0
+                  val snap = items.toList()
+                  viewModelScope.launch(Dispatchers.Default) {
+                      try {
+                          val rnd = Random(System.nanoTime())
+                          val conds = snap.map { Lang.cond(it.tags) }
+                          val order = MutableList(snap.size) { it }
+                          synchronized(lock) { model.prepTrain() }
+                          val bs = 8
+                          for (e in 1..epochs) {
+                              if (stopFlag) break
+                              java.util.Collections.shuffle(order, rnd)
+                              var tot = 0.0
+                              var i = 0
+                              while (i < order.size) {
+                                  val end = min(i + bs, order.size)
+                                  synchronized(lock) {
+                                      for (k in i until end) {
+                                          val idx = order[k]
+                                          tot += model.trainSample(augment(snap[idx].px, rnd), conds[idx], 1f)
+                                      }
+                                      model.adamStep(8e-4f, end - i)
+                                  }
+                                  i = end
+                                  if (stopFlag) break
+                              }
+                              loss = (tot / order.size / Cfg.D).toFloat()
+                              lossHistory.add(loss)
+                              if (lossHistory.size > 400) lossHistory.removeAt(0)
+                              trainedEpochs++
+                              epoch = e
+                              latentsDirty = true
+                              if (e % 4 == 0 || e == epochs) makePreview()
+                              if (e % 10 == 0) synchronized(lock) { model.save(modelFile, trainedEpochs) }
+                          }
+                          synchronized(lock) { model.save(modelFile, trainedEpochs) }
+                          makePreview()
+                          toast = if (stopFlag) "Training gestoppt & gespeichert" else "Training fertig ✓ – probier den Chat!"
+                      } catch (t: Throwable) {
+                          toast = "Trainingsfehler: ${t.message}"
+                      } finally {
+                          synchronized(lock) { model.freeTrain() }
+                          training = false
+                      }
+                  }
+              }
+
+              fun stopTraining() { stopFlag = true }
+
+              fun resetModel() {
+                  if (training) return
+                  synchronized(lock) { model = VAE(); latentsDirty = true }
+                  modelFile.delete()
+                  trainedEpochs = 0
+                  lossHistory.clear()
+                  preview = null
+                  toast = "Modell zurückgesetzt"
+              }
+
+              private fun augment(px: FloatArray, rnd: Random): FloatArray {
+                  val s = Cfg.S
+                  val out = FloatArray(Cfg.D)
+                  val flip = rnd.nextBoolean()
+                  val br = 1f + (rnd.nextFloat() - 0.5f) * 0.1f
+                  for (y in 0 until s) for (x in 0 until s) {
+                      val sx = if (flip) s - 1 - x else x
+                      for (ch in 0..2) out[(y * s + x) * 3 + ch] = (px[(y * s + sx) * 3 + ch] * br).coerceIn(0f, 1f)
+                  }
+                  return out
+              }
+
+              private fun makePreview() {
+                  val s = items.toList()
+                  if (s.isEmpty()) return
+                  val pick = s[Random().nextInt(s.size)]
+                  preview = generate(pick.tags.joinToString(" "), 0.2f, System.nanoTime()).big
+              }
+
+              // ---------------- Chat & Generierung ----------------
+
+              fun send(text: String) {
+                  val t = text.trim()
+                  if (t.isEmpty()) return
+                  messages.add(Msg(nextId(), true, text = t))
+                  val low = t.lowercase()
+                  when {
+                      low == "hilfe" || low == "help" || low == "?" -> reply(
+                          "So funktioniere ich:\n• Ich bin ein kleines generatives Modell (CVAE, 48×48 px, hochskaliert), selbst in Kotlin geschrieben – kein Server, keine API.\n" +
+                              "• Jedes Bild wird neu aus gelernten Konzepten gemischt, nie 1:1 kopiert. „Variation“ regelt, wie frei ich mische.\n" +
+                              "• Mehr Bilder pro Stichwort + mehr Epochen = bessere Ergebnisse. 👍 Lernen fügt ein gutes Ergebnis deiner Bibliothek hinzu.\n" +
+                              "• Ehrlich: ChatGPT-/Midjourney-Qualität ist auf einem Handy nicht erreichbar – aber ich werde mit deinen Daten spürbar besser."
+                      )
+                      low.startsWith("status") -> reply(
+                          "Ich kenne ${items.size} Bilder mit ${topTags(999).size} Stichwörtern und habe $trainedEpochs Epochen trainiert." +
+                              (if (lossHistory.isNotEmpty()) " Letzter Loss: ${"%.3f".format(lossHistory.last())}." else "")
+                      )
+                      items.isEmpty() -> reply("Ich kenne noch keine Bilder. Geh in die Bibliothek und lade ein paar mit Stichwörtern hoch 🖼")
+                      trainedEpochs == 0 -> reply("Ich habe noch nichts gelernt. Starte im Tab „Training“ das Lernen 🧠")
+                      else -> {
+                          val m = Msg(nextId(), false, prompt = t)
+                          messages.add(m)
+                          startGen(m)
+                      }
+                  }
+              }
+
+              fun regenerate(old: Msg) {
+                  val m = Msg(nextId(), false, prompt = old.prompt)
+                  messages.add(m)
+                  startGen(m)
+              }
+
+              private fun startGen(m: Msg) {
+                  viewModelScope.launch {
+                      val job = async(Dispatchers.Default) { generate(m.prompt, variation, System.nanoTime()) }
+                      val stages = listOf("Analysiere Stichwörter…", "Mische Latent-Vektoren…", "Dekodiere Pixel…", "Veredle Details…")
+                      for (s in stages) { m.stage = s; delay(450) }
+                      val g = job.await()
+                      m.frames = withContext(Dispatchers.Default) { makeFrames(g.small) }
+                      m.small = g.small
+                      m.caption = g.caption
+                      m.image = g.big
+                  }
+              }
+
+              private fun refreshLatents(snap: List<Item>) {
+                  if (!latentsDirty && snap.all { latents.containsKey(it.id) }) return
+                  latents.clear()
+                  for (it0 in snap) latents[it0.id] = model.encodeMean(it0.px, Lang.cond(it0.tags))
+                  latentsDirty = false
+              }
+
+              private fun generate(prompt: String, variation: Float, seed: Long): Gen {
+                  val toks = Lang.tokens(prompt)
+                  val c = Lang.cond(toks)
+                  val rnd = Random(seed)
+                  val snap = items.toList()
+                  val known = snap.flatMap { it.tags }.toSet()
+                  val z = FloatArray(Cfg.Z)
+                  val pix = synchronized(lock) {
+                      refreshLatents(snap)
+                      val matched = snap.map { it to it.tags.count { t -> t in toks } }
+                          .filter { it.second > 0 }.sortedByDescending { it.second }.map { it.first }
+                      val pool = (if (matched.isNotEmpty()) matched.take(8) else snap).toMutableList()
+                      java.util.Collections.shuffle(pool, rnd)
+                      val k = min(pool.size, 2 + rnd.nextInt(2))
+                      val w = FloatArray(k) { 0.25f + rnd.nextFloat() }
+                      val sw = w.sum()
+                      for (j in 0 until k) {
+                          val lat = latents[pool[j].id] ?: continue
+                          for (d in 0 until Cfg.Z) z[d] += lat[d] * w[j] / sw
+                      }
+                      val noise = (if (matched.isEmpty()) 1.0f else 0.8f) * variation
+                      for (d in 0 until Cfg.Z) z[d] += (rnd.nextGaussian() * noise).toFloat()
+                      model.decode(z, c)
+                  }
+                  val ints = IntArray(Cfg.S * Cfg.S)
+                  for (p in ints.indices) {
+                      ints[p] = (255 shl 24) or (to255(pix[p * 3]) shl 16) or (to255(pix[p * 3 + 1]) shl 8) or to255(pix[p * 3 + 2])
+                  }
+                  val small = Bitmap.createBitmap(Cfg.S, Cfg.S, Bitmap.Config.ARGB_8888)
+                  small.setPixels(ints, 0, Cfg.S, 0, 0, Cfg.S, Cfg.S)
+                  var big = small
+                  while (big.width < 384) big = Bitmap.createScaledBitmap(big, big.width * 2, big.height * 2, true)
+                  val hit = toks.filter { it in known }
+                  val unknown = toks.filter { it !in known }
+                  val cap = buildString {
+                      if (hit.isNotEmpty()) append("Konzepte: ${hit.joinToString(" + ")}")
+                      if (unknown.isNotEmpty()) {
+                          if (isNotEmpty()) append(" · ")
+                          append("Unbekannt: ${unknown.joinToString()}")
+                      }
+                  }
+                  return Gen(small, big, cap)
+              }
+
+              private fun to255(v: Float): Int = (((v - 0.5f) * 1.1f + 0.5f).coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255)
+
+              /** Frames fuer die Erstellungs-Animation: Rauschen -> Klötzchen -> scharfes Bild. */
+              private fun makeFrames(fin: Bitmap): List<Bitmap> {
+                  val s = Cfg.S
+                  val px = IntArray(s * s)
+                  fin.getPixels(px, 0, s, 0, 0, s, s)
+                  val res = intArrayOf(1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48)
+                  val rnd = Random(1)
+                  return res.mapIndexed { i, rr ->
+                      val t = i.toFloat() / (res.size - 1)
+                      val n = (1f - t) * (1f - t) * 0.55f
+                      val out = IntArray(s * s)
+                      for (y in 0 until s) for (x in 0 until s) {
+                          val sy = (((y * rr / s).toFloat() + 0.5f) * s / rr).toInt().coerceIn(0, s - 1)
+                          val sx = (((x * rr / s).toFloat() + 0.5f) * s / rr).toInt().coerceIn(0, s - 1)
+                          val c = px[sy * s + sx]
+                          val r = (((c shr 16) and 255) * (1f - n) + rnd.nextInt(256) * n).toInt()
+                          val g = (((c shr 8) and 255) * (1f - n) + rnd.nextInt(256) * n).toInt()
+                          val b = ((c and 255) * (1f - n) + rnd.nextInt(256) * n).toInt()
+                          out[y * s + x] = (255 shl 24) or (r shl 16) or (g shl 8) or b
+                      }
+                      val bm = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                      bm.setPixels(out, 0, s, 0, 0, s, s)
+                      bm
+                  }
+              }
+
+              fun learn(m: Msg) {
+                  val small = m.small ?: return
+                  if (m.learned) return
+                  val tags = Lang.tokens(m.prompt)
+                  if (tags.isEmpty()) { toast = "Keine Stichwörter im Prompt"; return }
+                  viewModelScope.launch {
+                      val it0 = withContext(Dispatchers.IO) { store.create(small, tags) }
+                      items.add(it0)
+                      withContext(Dispatchers.IO) { store.persist(items.toList()) }
+                      latentsDirty = true
+                      m.learned = true
+                      toast = "Gemerkt! Beim nächsten Training lerne ich das Bild mit."
+                  }
+              }
+
+              fun saveImage(bmp: Bitmap) {
+                  viewModelScope.launch(Dispatchers.IO) {
+                      val ok = try {
+                          val v = ContentValues().apply {
+                              put(MediaStore.Images.Media.DISPLAY_NAME, "neuroforge_${System.currentTimeMillis()}.png")
+                              put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                              put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/NeuroForge")
+                          }
+                          val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
+                          if (uri != null) {
+                              ctx.contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                              true
+                          } else false
+                      } catch (e: Exception) {
+                          false
+                      }
+                      toast = if (ok) "Gespeichert in Galerie (Pictures/NeuroForge)" else "Speichern fehlgeschlagen"
+                  }
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/MainActivity.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.viewModels
+
+          class MainActivity : ComponentActivity() {
+              private val vm: AppVM by viewModels()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { App(vm) }
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/Model.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import java.io.BufferedInputStream
+          import java.io.BufferedOutputStream
+          import java.io.DataInputStream
+          import java.io.DataOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.nio.ByteBuffer
+          import java.util.Random
+          import kotlin.math.exp
+          import kotlin.math.ln
+          import kotlin.math.pow
+          import kotlin.math.sqrt
+
+          object Cfg {
+              const val S = 48            // Bildgroesse in Pixeln
+              const val D = S * S * 3     // Pixel-Eingabe
+              const val C = 128           // Stichwort-Vektor (gehasht)
+              const val H = 256           // Hidden
+              const val Z = 48            // Latent-Raum
+          }
+
+          object Lang {
+              private val stop = setOf(
+                  "ein", "eine", "einen", "einem", "einer", "der", "die", "das", "den", "dem", "und", "mit", "von",
+                  "im", "in", "auf", "zu", "mal", "bitte", "male", "mache", "mach", "erstelle", "erstell", "zeichne",
+                  "generiere", "bild", "bilder", "foto", "an", "am", "aus", "ist", "sind", "fuer", "für", "mir", "ich",
+                  "will", "möchte", "kannst", "du", "the", "of", "draw", "make", "create", "generate", "image",
+                  "picture", "me", "please", "show", "zeige", "zeig", "ein", "wie", "als", "bei", "ohne"
+              )
+
+              fun stem(w: String): String {
+                  for (suf in listOf("en", "er", "es", "e", "n", "s")) {
+                      if (w.length > 4 && w.endsWith(suf)) return w.dropLast(suf.length)
+                  }
+                  return w
+              }
+
+              fun tokens(t: String): List<String> =
+                  t.lowercase().split(Regex("[^\\p{L}\\p{N}]+"))
+                      .filter { it.length > 1 && it !in stop }
+                      .map { stem(it) }
+                      .distinct()
+
+              fun cond(tokens: List<String>): FloatArray {
+                  val v = FloatArray(Cfg.C)
+                  for (t in tokens) {
+                      val h = t.hashCode()
+                      v[Math.floorMod(h, Cfg.C)] = 1f
+                      v[Math.floorMod(h * -1640531527, Cfg.C)] = 1f
+                  }
+                  return v
+              }
+          }
+
+          private fun relu(a: FloatArray) {
+              for (i in a.indices) if (a[i] < 0f) a[i] = 0f
+          }
+
+          class Dense(val nin: Int, val nout: Int, rnd: Random, scale: Float) {
+              val w = FloatArray(nin * nout) { (rnd.nextGaussian() * scale).toFloat() }
+              val b = FloatArray(nout)
+              private var gw = FloatArray(0)
+              private var gb = FloatArray(0)
+              private var mw = FloatArray(0)
+              private var vw = FloatArray(0)
+              private var mb = FloatArray(0)
+              private var vb = FloatArray(0)
+
+              fun prepTrain() {
+                  if (gw.size == w.size) return
+                  gw = FloatArray(w.size); mw = FloatArray(w.size); vw = FloatArray(w.size)
+                  gb = FloatArray(b.size); mb = FloatArray(b.size); vb = FloatArray(b.size)
+              }
+
+              fun freeTrain() {
+                  gw = FloatArray(0); mw = FloatArray(0); vw = FloatArray(0)
+                  gb = FloatArray(0); mb = FloatArray(0); vb = FloatArray(0)
+              }
+
+              fun forward(x: FloatArray, out: FloatArray) {
+                  for (o in 0 until nout) {
+                      var s = b[o]
+                      val base = o * nin
+                      for (i in 0 until nin) s += w[base + i] * x[i]
+                      out[o] = s
+                  }
+              }
+
+              fun backward(x: FloatArray, dy: FloatArray, dx: FloatArray?) {
+                  if (dx != null) java.util.Arrays.fill(dx, 0, nin, 0f)
+                  for (o in 0 until nout) {
+                      val g = dy[o]
+                      gb[o] += g
+                      if (g == 0f) continue
+                      val base = o * nin
+                      if (dx != null) {
+                          for (i in 0 until nin) {
+                              gw[base + i] += g * x[i]
+                              dx[i] += g * w[base + i]
+                          }
+                      } else {
+                          for (i in 0 until nin) gw[base + i] += g * x[i]
+                      }
+                  }
+              }
+
+              fun step(lr: Float, t: Int, scale: Float) {
+                  val b1 = 0.9f
+                  val b2 = 0.999f
+                  val c1 = 1f - b1.pow(t)
+                  val c2 = 1f - b2.pow(t)
+                  adam(w, gw, mw, vw, lr, b1, b2, c1, c2, scale)
+                  adam(b, gb, mb, vb, lr, b1, b2, c1, c2, scale)
+              }
+
+              private fun adam(
+                  p: FloatArray, g: FloatArray, m: FloatArray, v: FloatArray,
+                  lr: Float, b1: Float, b2: Float, c1: Float, c2: Float, scale: Float
+              ) {
+                  for (i in p.indices) {
+                      val gi = g[i] * scale
+                      val mi = b1 * m[i] + (1f - b1) * gi
+                      val vi = b2 * v[i] + (1f - b2) * gi * gi
+                      m[i] = mi
+                      v[i] = vi
+                      p[i] -= lr * (mi / c1) / (sqrt(vi / c2) + 1e-8f)
+                      g[i] = 0f
+                  }
+              }
+          }
+
+          /** Conditional Variational Autoencoder – komplett in Kotlin, ohne Bibliothek, ohne API. */
+          class VAE {
+              private val rnd = Random(7)
+              val e1 = Dense(Cfg.D + Cfg.C, Cfg.H, rnd, sqrt(2f / (Cfg.D + Cfg.C)))
+              val mu = Dense(Cfg.H, Cfg.Z, rnd, 0.05f)
+              val lv = Dense(Cfg.H, Cfg.Z, rnd, 0.01f)
+              val d1 = Dense(Cfg.Z + Cfg.C, Cfg.H, rnd, sqrt(2f / (Cfg.Z + Cfg.C)))
+              val d2 = Dense(Cfg.H, Cfg.D, rnd, 0.05f)
+              private val layers get() = listOf(e1, mu, lv, d1, d2)
+              private var adamT = 0
+
+              private val inp = FloatArray(Cfg.D + Cfg.C)
+              private val h1 = FloatArray(Cfg.H)
+              private val muV = FloatArray(Cfg.Z)
+              private val lvV = FloatArray(Cfg.Z)
+              private val eps = FloatArray(Cfg.Z)
+              private val zc = FloatArray(Cfg.Z + Cfg.C)
+              private val h2 = FloatArray(Cfg.H)
+              private val logit = FloatArray(Cfg.D)
+              private val dlogit = FloatArray(Cfg.D)
+              private val dh2 = FloatArray(Cfg.H)
+              private val dzc = FloatArray(Cfg.Z + Cfg.C)
+              private val dmu = FloatArray(Cfg.Z)
+              private val dlv = FloatArray(Cfg.Z)
+              private val dh1a = FloatArray(Cfg.H)
+              private val dh1b = FloatArray(Cfg.H)
+              private val dh1 = FloatArray(Cfg.H)
+
+              fun prepTrain() = layers.forEach { it.prepTrain() }
+              fun freeTrain() = layers.forEach { it.freeTrain() }
+
+              /** Ein Trainingsschritt fuer ein Bild; sammelt Gradienten. Gibt Loss zurueck. */
+              fun trainSample(x: FloatArray, c: FloatArray, beta: Float): Float {
+                  val D = Cfg.D; val C = Cfg.C; val Z = Cfg.Z; val H = Cfg.H
+                  System.arraycopy(x, 0, inp, 0, D)
+                  System.arraycopy(c, 0, inp, D, C)
+                  e1.forward(inp, h1); relu(h1)
+                  mu.forward(h1, muV)
+                  lv.forward(h1, lvV)
+                  for (j in 0 until Z) {
+                      lvV[j] = lvV[j].coerceIn(-8f, 4f)
+                      eps[j] = rnd.nextGaussian().toFloat()
+                      zc[j] = muV[j] + exp(0.5f * lvV[j]) * eps[j]
+                  }
+                  System.arraycopy(c, 0, zc, Z, C)
+                  d1.forward(zc, h2); relu(h2)
+                  d2.forward(h2, logit)
+
+                  var loss = 0f
+                  for (i in 0 until D) {
+                      val p = 1f / (1f + exp(-logit[i]))
+                      val xi = x[i]
+                      loss -= xi * ln(p + 1e-6f) + (1f - xi) * ln(1f - p + 1e-6f)
+                      dlogit[i] = p - xi
+                  }
+                  d2.backward(h2, dlogit, dh2)
+                  for (i in 0 until H) if (h2[i] <= 0f) dh2[i] = 0f
+                  d1.backward(zc, dh2, dzc)
+
+                  var kl = 0f
+                  for (j in 0 until Z) {
+                      val e = exp(lvV[j])
+                      kl += -0.5f * (1f + lvV[j] - muV[j] * muV[j] - e)
+                      val std = exp(0.5f * lvV[j])
+                      dmu[j] = dzc[j] + beta * muV[j]
+                      dlv[j] = dzc[j] * eps[j] * 0.5f * std + beta * 0.5f * (e - 1f)
+                  }
+                  mu.backward(h1, dmu, dh1a)
+                  lv.backward(h1, dlv, dh1b)
+                  for (i in 0 until H) dh1[i] = if (h1[i] > 0f) dh1a[i] + dh1b[i] else 0f
+                  e1.backward(inp, dh1, null)
+                  return loss + beta * kl
+              }
+
+              fun adamStep(lr: Float, batch: Int) {
+                  adamT++
+                  val s = 1f / batch
+                  layers.forEach { it.step(lr, adamT, s) }
+              }
+
+              fun encodeMean(x: FloatArray, c: FloatArray): FloatArray {
+                  System.arraycopy(x, 0, inp, 0, Cfg.D)
+                  System.arraycopy(c, 0, inp, Cfg.D, Cfg.C)
+                  e1.forward(inp, h1); relu(h1)
+                  mu.forward(h1, muV)
+                  return muV.copyOf()
+              }
+
+              fun decode(z: FloatArray, c: FloatArray): FloatArray {
+                  System.arraycopy(z, 0, zc, 0, Cfg.Z)
+                  System.arraycopy(c, 0, zc, Cfg.Z, Cfg.C)
+                  d1.forward(zc, h2); relu(h2)
+                  d2.forward(h2, logit)
+                  return FloatArray(Cfg.D) { 1f / (1f + exp(-logit[it])) }
+              }
+
+              fun save(f: File, epochs: Int) {
+                  val tmp = File(f.path + ".tmp")
+                  DataOutputStream(BufferedOutputStream(FileOutputStream(tmp))).use { o ->
+                      o.writeInt(MAGIC); o.writeInt(epochs)
+                      o.writeInt(Cfg.S); o.writeInt(Cfg.C); o.writeInt(Cfg.H); o.writeInt(Cfg.Z)
+                      for (l in layers) { writeFloats(o, l.w); writeFloats(o, l.b) }
+                  }
+                  tmp.renameTo(f)
+              }
+
+              /** Gibt trainierte Epochen zurueck oder -1 bei Fehler. */
+              fun load(f: File): Int {
+                  return try {
+                      DataInputStream(BufferedInputStream(FileInputStream(f))).use { i ->
+                          if (i.readInt() != MAGIC) return -1
+                          val ep = i.readInt()
+                          if (i.readInt() != Cfg.S || i.readInt() != Cfg.C || i.readInt() != Cfg.H || i.readInt() != Cfg.Z) return -1
+                          for (l in layers) { readFloats(i, l.w); readFloats(i, l.b) }
+                          ep
+                      }
+                  } catch (e: Exception) {
+                      -1
+                  }
+              }
+
+              private fun writeFloats(o: DataOutputStream, a: FloatArray) {
+                  val bb = ByteBuffer.allocate(a.size * 4)
+                  bb.asFloatBuffer().put(a)
+                  o.write(bb.array())
+              }
+
+              private fun readFloats(i: DataInputStream, a: FloatArray) {
+                  val bytes = ByteArray(a.size * 4)
+                  i.readFully(bytes)
+                  ByteBuffer.wrap(bytes).asFloatBuffer().get(a)
+              }
+
+              companion object {
+                  const val MAGIC = 0x4E465631
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/Store.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.ImageDecoder
+          import android.net.Uri
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.UUID
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class Item(val id: String, val tags: List<String>, val bmp: Bitmap) {
+              val px: FloatArray = Pix.toFloats(bmp)
+          }
+
+          object Pix {
+              fun load(ctx: Context, uri: Uri): Bitmap {
+                  val src = ImageDecoder.createSource(ctx.contentResolver, uri)
+                  val bmp = ImageDecoder.decodeBitmap(src) { dec, info, _ ->
+                      dec.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE)
+                      val w = info.size.width
+                      val h = info.size.height
+                      val sc = min(1f, 512f / max(w, h))
+                      dec.setTargetSize(max(1, (w * sc).toInt()), max(1, (h * sc).toInt()))
+                  }
+                  return prepare(bmp)
+              }
+
+              fun prepare(src: Bitmap): Bitmap {
+                  val m = min(src.width, src.height)
+                  var cur = Bitmap.createBitmap(src, (src.width - m) / 2, (src.height - m) / 2, m, m)
+                  while (cur.width >= Cfg.S * 2) {
+                      cur = Bitmap.createScaledBitmap(cur, max(Cfg.S, cur.width / 2), max(Cfg.S, cur.height / 2), true)
+                  }
+                  if (cur.width != Cfg.S) cur = Bitmap.createScaledBitmap(cur, Cfg.S, Cfg.S, true)
+                  return cur.copy(Bitmap.Config.ARGB_8888, false)
+              }
+
+              fun toFloats(b: Bitmap): FloatArray {
+                  val s = Cfg.S
+                  val p = IntArray(s * s)
+                  b.getPixels(p, 0, s, 0, 0, s, s)
+                  val out = FloatArray(Cfg.D)
+                  for (i in p.indices) {
+                      val c = p[i]
+                      out[i * 3] = ((c shr 16) and 255) / 255f
+                      out[i * 3 + 1] = ((c shr 8) and 255) / 255f
+                      out[i * 3 + 2] = (c and 255) / 255f
+                  }
+                  return out
+              }
+          }
+
+          class Store(ctx: Context) {
+              private val dir = File(ctx.filesDir, "data").apply { mkdirs() }
+              private val idx = File(dir, "index.json")
+
+              fun load(): List<Item> {
+                  val out = ArrayList<Item>()
+                  try {
+                      if (!idx.exists()) return out
+                      val arr = JSONArray(idx.readText())
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          val id = o.getString("id")
+                          val ta = o.getJSONArray("tags")
+                          val tags = (0 until ta.length()).map { ta.getString(it) }
+                          val bmp = BitmapFactory.decodeFile(File(dir, "$id.png").path) ?: continue
+                          if (bmp.width != Cfg.S || bmp.height != Cfg.S) continue
+                          out.add(Item(id, tags, bmp))
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return out
+              }
+
+              fun persist(items: List<Item>) {
+                  val arr = JSONArray()
+                  for (it in items) {
+                      val o = JSONObject()
+                      o.put("id", it.id)
+                      o.put("tags", JSONArray(it.tags))
+                      arr.put(o)
+                  }
+                  idx.writeText(arr.toString())
+              }
+
+              fun create(bmp: Bitmap, tags: List<String>): Item {
+                  val id = UUID.randomUUID().toString().replace("-", "")
+                  FileOutputStream(File(dir, "$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                  return Item(id, tags, bmp)
+              }
+
+              fun remove(item: Item) {
+                  File(dir, "${item.id}.png").delete()
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/java/com/neuroforge/app
+          cat > app/src/main/java/com/neuroforge/app/Ui.kt <<'__NF_EOF__'
+          package com.neuroforge.app
+
+          import android.net.Uri
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ColumnScope
+          import androidx.compose.foundation.layout.ExperimentalLayoutApi
+          import androidx.compose.foundation.layout.FlowRow
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.widthIn
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicText
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.SliderDefaults
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.SideEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.FilterQuality
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+
+          object P {
+              val bg = Color(0xFF07070D)
+              val card = Color(0xFF12121C)
+              val card2 = Color(0xFF1B1B2B)
+              val line = Color(0xFF2A2A40)
+              val violet = Color(0xFF8B5CF6)
+              val cyan = Color(0xFF22D3EE)
+              val pink = Color(0xFFF472B6)
+              val text = Color(0xFFEDEDF7)
+              val dim = Color(0xFF8E8EA8)
+              val grad = Brush.linearGradient(listOf(violet, pink, cyan))
+              val gradV = Brush.linearGradient(listOf(Color(0xFF7C3AED), Color(0xFF4F46E5)))
+          }
+
+          @Composable
+          fun T(
+              s: String, c: Color = P.text, sz: Int = 14, w: FontWeight = FontWeight.Normal,
+              m: Modifier = Modifier, a: TextAlign? = null
+          ) {
+              Text(s, modifier = m, color = c, fontSize = sz.sp, fontWeight = w, textAlign = a)
+          }
+
+          @Composable
+          fun Pill(text: String, filled: Boolean = false, onClick: () -> Unit) {
+              val shape = RoundedCornerShape(50)
+              Box(
+                  Modifier.clip(shape)
+                      .background(if (filled) P.grad else SolidColor(P.card2))
+                      .border(1.dp, if (filled) Color.Transparent else P.line, shape)
+                      .clickable { onClick() }
+                      .padding(horizontal = 12.dp, vertical = 7.dp)
+              ) { T(text, if (filled) Color.White else P.text, 12, FontWeight.Medium) }
+          }
+
+          @Composable
+          fun Panel(content: @Composable ColumnScope.() -> Unit) {
+              val shape = RoundedCornerShape(20.dp)
+              Column(
+                  Modifier.fillMaxWidth().clip(shape).background(P.card).border(1.dp, P.line, shape).padding(14.dp),
+                  content = content
+              )
+          }
+
+          @Composable
+          fun Stat(label: String, value: String, m: Modifier) {
+              val shape = RoundedCornerShape(16.dp)
+              Column(
+                  m.clip(shape).background(P.card).border(1.dp, P.line, shape).padding(12.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  BasicText(value, style = TextStyle(brush = P.grad, fontSize = 22.sp, fontWeight = FontWeight.Black))
+                  T(label, P.dim, 11)
+              }
+          }
+
+          // ------------------------------------------------------------------ App
+
+          @Composable
+          fun App(vm: AppVM) {
+              MaterialTheme(colorScheme = darkColorScheme(primary = P.violet, background = P.bg, surface = P.card)) {
+                  var tab by remember { mutableIntStateOf(0) }
+                  Box(
+                      Modifier.fillMaxSize().background(P.bg).drawBehind {
+                          drawRect(
+                              Brush.radialGradient(
+                                  listOf(P.violet.copy(alpha = 0.25f), Color.Transparent),
+                                  center = Offset(size.width * 0.9f, 0f), radius = size.width
+                              )
+                          )
+                          drawRect(
+                              Brush.radialGradient(
+                                  listOf(P.cyan.copy(alpha = 0.12f), Color.Transparent),
+                                  center = Offset(0f, size.height), radius = size.width * 0.9f
+                              )
+                          )
+                      }
+                  ) {
+                      Column(Modifier.fillMaxSize()) {
+                          Header(vm)
+                          Box(Modifier.weight(1f)) {
+                              when (tab) {
+                                  0 -> ChatScreen(vm)
+                                  1 -> LibraryScreen(vm)
+                                  else -> TrainScreen(vm)
+                              }
+                          }
+                          BottomBar(tab) { tab = it }
+                      }
+                      val t = vm.toast
+                      if (t != null) {
+                          LaunchedEffect(t) {
+                              delay(3200)
+                              if (vm.toast == t) vm.toast = null
+                          }
+                          val shape = RoundedCornerShape(16.dp)
+                          Box(
+                              Modifier.align(Alignment.TopCenter).padding(top = 64.dp, start = 16.dp, end = 16.dp)
+                                  .clip(shape).background(P.card2).border(1.dp, P.violet.copy(alpha = 0.6f), shape)
+                                  .padding(horizontal = 16.dp, vertical = 10.dp)
+                          ) { T(t, sz = 13) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Header(vm: AppVM) {
+              Row(
+                  Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(Modifier.size(38.dp).clip(CircleShape).background(P.grad), contentAlignment = Alignment.Center) {
+                      T("✦", Color.White, 18, FontWeight.Bold)
+                  }
+                  Spacer(Modifier.width(10.dp))
+                  Column {
+                      BasicText("NeuroForge", style = TextStyle(brush = P.grad, fontSize = 22.sp, fontWeight = FontWeight.Black))
+                      val lossTxt = "%.3f".format(vm.loss)
+                      val sub = if (vm.training) "⚡ Training ${vm.epoch}/${vm.totalEp} · Loss $lossTxt"
+                      else "🧠 ${vm.trainedEpochs} Epochen · ${vm.items.size} Bilder gelernt"
+                      T(sub, P.dim, 11)
+                  }
+              }
+          }
+
+          @Composable
+          fun BottomBar(sel: Int, onSel: (Int) -> Unit) {
+              val tabs = listOf("💬" to "Chat", "🖼" to "Bibliothek", "🧠" to "Training")
+              Row(
+                  Modifier.fillMaxWidth().background(P.card.copy(alpha = 0.95f)).padding(horizontal = 12.dp, vertical = 8.dp),
+                  horizontalArrangement = Arrangement.SpaceEvenly
+              ) {
+                  tabs.forEachIndexed { i, (e, n) ->
+                      val on = i == sel
+                      Column(
+                          Modifier.weight(1f).clip(RoundedCornerShape(16.dp))
+                              .background(if (on) P.violet.copy(alpha = 0.22f) else Color.Transparent)
+                              .clickable { onSel(i) }.padding(vertical = 8.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally
+                      ) {
+                          T(e, sz = 20)
+                          T(n, if (on) P.text else P.dim, 11, if (on) FontWeight.Bold else FontWeight.Normal)
+                      }
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------ Chat
+
+          @Composable
+          fun ChatScreen(vm: AppVM) {
+              val listState = rememberLazyListState()
+              LaunchedEffect(vm.messages.size, vm.messages.lastOrNull()?.image) {
+                  if (vm.messages.isNotEmpty()) listState.animateScrollToItem(vm.messages.size - 1)
+              }
+              Column(Modifier.fillMaxSize()) {
+                  LazyColumn(
+                      state = listState,
+                      modifier = Modifier.weight(1f).fillMaxWidth(),
+                      contentPadding = PaddingValues(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      items(vm.messages, key = { it.id }) { m -> MsgRow(vm, m) }
+                  }
+                  val tags = vm.topTags(8)
+                  if (tags.isNotEmpty()) {
+                      Row(
+                          Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
+                          horizontalArrangement = Arrangement.spacedBy(6.dp)
+                      ) {
+                          tags.forEach { (t, _) -> Pill("✦ $t") { vm.draft = (vm.draft + " " + t).trim() } }
+                      }
+                  }
+                  Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                      T("🎛 Variation", P.dim, 12)
+                      Slider(
+                          value = vm.variation,
+                          onValueChange = { vm.variation = it },
+                          modifier = Modifier.weight(1f).padding(start = 8.dp),
+                          colors = SliderDefaults.colors(
+                              thumbColor = P.cyan, activeTrackColor = P.violet, inactiveTrackColor = P.card2
+                          )
+                      )
+                  }
+                  val inShape = RoundedCornerShape(26.dp)
+                  Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Box(
+                          Modifier.weight(1f).clip(inShape).background(P.card).border(1.dp, P.line, inShape)
+                              .padding(horizontal = 16.dp, vertical = 13.dp)
+                      ) {
+                          if (vm.draft.isEmpty()) T("Beschreibe ein Bild …", P.dim, 15)
+                          BasicTextField(
+                              value = vm.draft,
+                              onValueChange = { vm.draft = it },
+                              textStyle = TextStyle(color = P.text, fontSize = 15.sp),
+                              cursorBrush = SolidColor(P.cyan),
+                              maxLines = 4,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+                      }
+                      Spacer(Modifier.width(8.dp))
+                      Box(
+                          Modifier.size(50.dp).clip(CircleShape).background(P.grad)
+                              .clickable { vm.send(vm.draft); vm.draft = "" },
+                          contentAlignment = Alignment.Center
+                      ) { T("➤", Color.White, 20, FontWeight.Bold) }
+                  }
+              }
+          }
+
+          @Composable
+          fun MsgRow(vm: AppVM, m: Msg) {
+              if (m.fromUser) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                      Box(
+                          Modifier.widthIn(max = 290.dp).clip(RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp))
+                              .background(P.gradV).padding(horizontal = 14.dp, vertical = 10.dp)
+                      ) { T(m.text ?: "", Color.White, 15) }
+                  }
+              } else {
+                  val shape = RoundedCornerShape(4.dp, 20.dp, 20.dp, 20.dp)
+                  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                      Box(Modifier.size(30.dp).clip(CircleShape).background(P.grad), contentAlignment = Alignment.Center) {
+                          T("✦", Color.White, 14)
+                      }
+                      Spacer(Modifier.width(8.dp))
+                      Column(
+                          Modifier.widthIn(max = 310.dp).clip(shape).background(P.card).border(1.dp, P.line, shape).padding(12.dp)
+                      ) {
+                          val t = m.text
+                          if (t != null) T(t, P.text, 15) else ImageMsg(vm, m)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ImageMsg(vm: AppVM, m: Msg) {
+              val img = m.image
+              if (img == null) {
+                  Thinking(m.stage)
+                  return
+              }
+              RevealImage(m, img)
+              if (m.caption.isNotEmpty()) {
+                  Spacer(Modifier.height(6.dp))
+                  T(m.caption, P.dim, 11, m = Modifier.widthIn(max = 260.dp))
+              }
+              Spacer(Modifier.height(8.dp))
+              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                  Pill("🔁 Neu") { vm.regenerate(m) }
+                  Pill("💾 Speichern") { vm.saveImage(img) }
+                  Pill(if (m.learned) "✅ Gemerkt" else "👍 Lernen") { vm.learn(m) }
+              }
+          }
+
+          @Composable
+          fun Thinking(stage: String) {
+              val t = rememberInfiniteTransition(label = "think")
+              val pulse by t.animateFloat(0.85f, 1.15f, infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "pulse")
+              val rot by t.animateFloat(0f, 360f, infiniteRepeatable(tween(2200, easing = LinearEasing)), label = "rot")
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Box(
+                      Modifier.size(34.dp)
+                          .graphicsLayer { scaleX = pulse; scaleY = pulse; rotationZ = rot }
+                          .clip(CircleShape)
+                          .background(Brush.sweepGradient(listOf(P.violet, P.cyan, P.pink, P.violet)))
+                  )
+                  Spacer(Modifier.width(12.dp))
+                  T(if (stage.isEmpty()) "Denke nach…" else stage, P.dim, 13)
+              }
+          }
+
+          @Composable
+          fun RevealImage(m: Msg, img: android.graphics.Bitmap) {
+              var idx by remember { mutableIntStateOf(if (m.revealed) m.frames.size else 0) }
+              LaunchedEffect(m.id) {
+                  if (!m.revealed) {
+                      for (i in m.frames.indices) {
+                          idx = i
+                          delay(170)
+                      }
+                      idx = m.frames.size
+                      m.revealed = true
+                  }
+              }
+              val showFinal = idx >= m.frames.size
+              val tr = rememberInfiniteTransition(label = "glow")
+              val phase by tr.animateFloat(0f, 600f, infiniteRepeatable(tween(1600, easing = LinearEasing)), label = "phase")
+              val shape = RoundedCornerShape(20.dp)
+              val borderBrush = if (showFinal) Brush.linearGradient(listOf(P.violet.copy(alpha = 0.6f), P.cyan.copy(alpha = 0.6f)))
+              else Brush.linearGradient(
+                  listOf(P.violet, P.cyan, P.pink, P.violet),
+                  start = Offset(phase - 300f, 0f), end = Offset(phase + 300f, 600f)
+              )
+              Box(Modifier.size(260.dp).clip(shape).border(2.dp, borderBrush, shape)) {
+                  if (showFinal) {
+                      Image(img.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High)
+                  } else {
+                      Image(m.frames[idx].asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.None)
+                      Canvas(Modifier.fillMaxSize()) {
+                          val y = size.height * ((idx + 1f) / m.frames.size)
+                          drawRect(
+                              Brush.verticalGradient(
+                                  listOf(Color.Transparent, P.cyan.copy(alpha = 0.5f), Color.Transparent),
+                                  startY = y - 40f, endY = y + 40f
+                              ),
+                              topLeft = Offset(0f, y - 40f), size = Size(size.width, 80f)
+                          )
+                      }
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------ Bibliothek
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          fun LibraryScreen(vm: AppVM) {
+              var pending by remember { mutableStateOf<List<Uri>>(emptyList()) }
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  if (uris.isNotEmpty()) pending = uris
+              }
+              Column(Modifier.fillMaxSize()) {
+                  Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      Box(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(P.grad)
+                              .clickable { picker.launch("image/*") }.padding(vertical = 14.dp),
+                          contentAlignment = Alignment.Center
+                      ) { T("＋  Bilder hochladen & beschriften", Color.White, 15, FontWeight.Bold) }
+                      val tags = vm.topTags(12)
+                      if (tags.isNotEmpty()) {
+                          FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              tags.forEach { (t, n) ->
+                                  Box(Modifier.clip(RoundedCornerShape(50)).background(P.card2).padding(horizontal = 10.dp, vertical = 5.dp)) {
+                                      T("#$t · $n", P.cyan, 11)
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (vm.items.isEmpty()) {
+                      Box(Modifier.weight(1f).fillMaxWidth().padding(30.dp), contentAlignment = Alignment.Center) {
+                          T(
+                              "Noch leer.\nLade Bilder mit Stichwörtern hoch (z. B. „Sonnenuntergang rot Meer“). Je mehr Bilder pro Stichwort, desto besser lerne ich.",
+                              P.dim, 14, a = TextAlign.Center
+                          )
+                      }
+                  } else {
+                      LazyVerticalGrid(
+                          columns = GridCells.Fixed(3),
+                          modifier = Modifier.weight(1f),
+                          contentPadding = PaddingValues(12.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          verticalArrangement = Arrangement.spacedBy(8.dp)
+                      ) {
+                          items(vm.items, key = { it.id }) { item ->
+                              Column {
+                                  val shape = RoundedCornerShape(14.dp)
+                                  Box(Modifier.fillMaxWidth().aspectRatio(1f).clip(shape).border(1.dp, P.line, shape)) {
+                                      Image(
+                                          item.bmp.asImageBitmap(), null, Modifier.fillMaxSize(),
+                                          contentScale = ContentScale.Crop, filterQuality = FilterQuality.Low
+                                      )
+                                      Box(
+                                          Modifier.align(Alignment.TopEnd).padding(4.dp).size(22.dp).clip(CircleShape)
+                                              .background(Color.Black.copy(alpha = 0.6f)).clickable { vm.remove(item) },
+                                          contentAlignment = Alignment.Center
+                                      ) { T("✕", Color.White, 11) }
+                                  }
+                                  T(item.tags.joinToString(" · "), P.dim, 10)
+                              }
+                          }
+                      }
+                  }
+              }
+              if (pending.isNotEmpty()) {
+                  TagDialog(
+                      count = pending.size,
+                      onCancel = { pending = emptyList() },
+                      onOk = { tags -> vm.addImages(pending, tags); pending = emptyList() }
+                  )
+              }
+          }
+
+          @Composable
+          fun TagDialog(count: Int, onCancel: () -> Unit, onOk: (String) -> Unit) {
+              var tags by remember { mutableStateOf("") }
+              val shape = RoundedCornerShape(14.dp)
+              AlertDialog(
+                  onDismissRequest = onCancel,
+                  containerColor = P.card,
+                  title = { T("$count Bild(er) beschriften", sz = 18, w = FontWeight.Bold) },
+                  text = {
+                      Column {
+                          T("Stichwörter für alle gewählten Bilder (mit Leerzeichen oder Komma trennen):", P.dim, 13)
+                          Spacer(Modifier.height(10.dp))
+                          Box(Modifier.fillMaxWidth().clip(shape).background(P.card2).border(1.dp, P.line, shape).padding(12.dp)) {
+                              if (tags.isEmpty()) T("z. B. sonnenuntergang rot meer", P.dim, 14)
+                              BasicTextField(
+                                  value = tags, onValueChange = { tags = it },
+                                  textStyle = TextStyle(color = P.text, fontSize = 15.sp),
+                                  cursorBrush = SolidColor(P.cyan), modifier = Modifier.fillMaxWidth()
+                              )
+                          }
+                      }
+                  },
+                  confirmButton = { Pill("Hinzufügen", true) { onOk(tags) } },
+                  dismissButton = { Pill("Abbrechen") { onCancel() } }
+              )
+          }
+
+          // ------------------------------------------------------------------ Training
+
+          @Composable
+          fun TrainScreen(vm: AppVM) {
+              val view = LocalView.current
+              SideEffect { view.keepScreenOn = vm.training }
+              var epochs by remember { mutableFloatStateOf(60f) }
+              var confirmReset by remember { mutableStateOf(false) }
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Stat("Bilder", vm.items.size.toString(), Modifier.weight(1f))
+                      Stat("Epochen", vm.trainedEpochs.toString(), Modifier.weight(1f))
+                      Stat("Loss", if (vm.lossHistory.isEmpty()) "–" else "%.3f".format(vm.loss), Modifier.weight(1f))
+                  }
+                  Panel {
+                      T("Live-Vorschau", P.text, 15, FontWeight.Bold)
+                      Spacer(Modifier.height(10.dp))
+                      val shape = RoundedCornerShape(18.dp)
+                      Box(
+                          Modifier.size(200.dp).align(Alignment.CenterHorizontally).clip(shape).background(P.card2).border(1.dp, P.line, shape),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          val p = vm.preview
+                          if (p != null) Image(p.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High)
+                          else T("Noch keine Vorschau", P.dim, 12)
+                      }
+                  }
+                  Panel {
+                      T("Lernkurve", P.text, 15, FontWeight.Bold)
+                      Spacer(Modifier.height(8.dp))
+                      val h = vm.lossHistory.toList()
+                      Canvas(Modifier.fillMaxWidth().height(110.dp)) {
+                          if (h.size < 2) return@Canvas
+                          val mx = h.max()
+                          val mn = h.min()
+                          val rng = (mx - mn).coerceAtLeast(1e-6f)
+                          val path = Path()
+                          h.forEachIndexed { i, v ->
+                              val x = size.width * i / (h.size - 1)
+                              val y = size.height * 0.05f + size.height * 0.9f * (1f - (v - mn) / rng)
+                              if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                          }
+                          drawPath(path, P.grad, style = Stroke(width = 4f, cap = StrokeCap.Round))
+                      }
+                  }
+                  Panel {
+                      T("Training", P.text, 15, FontWeight.Bold)
+                      Spacer(Modifier.height(6.dp))
+                      if (vm.training) {
+                          val frac = if (vm.totalEp == 0) 0f else vm.epoch.toFloat() / vm.totalEp
+                          Box(Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(50)).background(P.card2)) {
+                              Box(Modifier.fillMaxWidth(frac.coerceIn(0.02f, 1f)).height(8.dp).clip(RoundedCornerShape(50)).background(P.grad))
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          T("Epoche ${vm.epoch} / ${vm.totalEp} – Bildschirm bleibt an", P.dim, 12)
+                      } else {
+                          T("Epochen: ${epochs.toInt()}", P.dim, 13)
+                          Slider(
+                              value = epochs, onValueChange = { epochs = it }, valueRange = 5f..300f,
+                              colors = SliderDefaults.colors(thumbColor = P.cyan, activeTrackColor = P.violet, inactiveTrackColor = P.card2)
+                          )
+                      }
+                      Spacer(Modifier.height(8.dp))
+                      Box(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                              .background(if (vm.training) SolidColor(Color(0xFFB91C1C)) else P.grad)
+                              .clickable { if (vm.training) vm.stopTraining() else vm.startTraining(epochs.toInt()) }
+                              .padding(vertical = 14.dp),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          T(if (vm.training) "⏹  Training stoppen" else "▶  Training starten", Color.White, 16, FontWeight.Bold)
+                      }
+                      Spacer(Modifier.height(8.dp))
+                      T(
+                          "Tipp: Pro Stichwort mindestens 10–20 Bilder, dann 100+ Epochen. Training kann jederzeit fortgesetzt werden – der Fortschritt wird gespeichert.",
+                          P.dim, 12
+                      )
+                  }
+                  Pill("🗑 Modell zurücksetzen") { confirmReset = true }
+                  Spacer(Modifier.height(8.dp))
+              }
+              if (confirmReset) {
+                  AlertDialog(
+                      onDismissRequest = { confirmReset = false },
+                      containerColor = P.card,
+                      title = { T("Modell zurücksetzen?", sz = 18, w = FontWeight.Bold) },
+                      text = { T("Alles Gelernte geht verloren. Deine Bilder in der Bibliothek bleiben erhalten.", P.dim, 14) },
+                      confirmButton = { Pill("Zurücksetzen", true) { vm.resetModel(); confirmReset = false } },
+                      dismissButton = { Pill("Abbrechen") { confirmReset = false } }
+                  )
+              }
+          }
+          __NF_EOF__
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_background.xml <<'__NF_EOF__'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M0,0h108v108h-108z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient android:type="radial" android:centerX="80" android:centerY="20" android:gradientRadius="120">
+                          <item android:offset="0" android:color="#FF3B1580" />
+                          <item android:offset="0.55" android:color="#FF120A2B" />
+                          <item android:offset="1" android:color="#FF07070D" />
+                      </gradient>
+                  </aapt:attr>
+              </path>
+          </vector>
+          __NF_EOF__
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'__NF_EOF__'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M54,54m-26,0a26,26 0 1,1 52,0a26,26 0 1,1 -52,0"
+                  android:strokeWidth="4">
+                  <aapt:attr name="android:strokeColor">
+                      <gradient android:type="linear" android:startX="28" android:startY="28" android:endX="80" android:endY="80">
+                          <item android:offset="0" android:color="#FF8B5CF6" />
+                          <item android:offset="0.5" android:color="#FFF472B6" />
+                          <item android:offset="1" android:color="#FF22D3EE" />
+                      </gradient>
+                  </aapt:attr>
+              </path>
+              <path android:pathData="M54,35 C55.5,46 62,52.5 73,54 C62,55.5 55.5,62 54,73 C52.5,62 46,55.5 35,54 C46,52.5 52.5,46 54,35 Z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient android:type="linear" android:startX="38" android:startY="38" android:endX="70" android:endY="70">
+                          <item android:offset="0" android:color="#FFFFFFFF" />
+                          <item android:offset="1" android:color="#FF9EE7FF" />
+                      </gradient>
+                  </aapt:attr>
+              </path>
+              <path android:pathData="M76,32m-3,0a3,3 0 1,1 6,0a3,3 0 1,1 -6,0" android:fillColor="#FF22D3EE" />
+              <path android:pathData="M32,76m-3,0a3,3 0 1,1 6,0a3,3 0 1,1 -6,0" android:fillColor="#FFF472B6" />
+              <path android:pathData="M78,72m-2,0a2,2 0 1,1 4,0a2,2 0 1,1 -4,0" android:fillColor="#FF8B5CF6" />
+          </vector>
+          __NF_EOF__
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'__NF_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          __NF_EOF__
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'__NF_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          __NF_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'__NF_EOF__'
+          <resources>
+              <string name="app_name">NeuroForge</string>
+          </resources>
+          __NF_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'__NF_EOF__'
+          <resources>
+              <style name="Theme.NeuroForge" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:statusBarColor">#07070D</item>
+                  <item name="android:navigationBarColor">#07070D</item>
+                  <item name="android:windowBackground">#07070D</item>
+              </style>
+          </resources>
+          __NF_EOF__
+          cat > build.gradle.kts <<'__NF_EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __NF_EOF__
+          cat > gradle.properties <<'__NF_EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __NF_EOF__
+          cat > settings.gradle.kts <<'__NF_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NeuroForge"
+          include(":app")
+          __NF_EOF__
+
+      - name: Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: APK bauen
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: APK hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuroForge-APK
+          path: app/build/outputs/apk/release/*.apk
