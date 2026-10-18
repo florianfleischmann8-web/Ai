@@ -890,6 +890,7 @@ jobs:
           import androidx.compose.foundation.lazy.rememberLazyListState
           import androidx.compose.foundation.lazy.grid.GridCells
           import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items as gridItems
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -1291,7 +1292,7 @@ jobs:
                           horizontalArrangement = Arrangement.spacedBy(8.dp),
                           verticalArrangement = Arrangement.spacedBy(8.dp)
                       ) {
-                          items(vm.items, key = { it.id }) { item ->
+                          gridItems(vm.items, key = { it.id }) { item ->
                               Column {
                                   val shape = RoundedCornerShape(14.dp)
                                   Box(Modifier.fillMaxWidth().aspectRatio(1f).clip(shape).border(1.dp, P.line, shape)) {
@@ -1560,7 +1561,7 @@ jobs:
           gradle-version: "8.7"
 
       - name: APK bauen
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: gradle assembleRelease --no-daemon --console=plain
 
       - name: APK hochladen
         uses: actions/upload-artifact@v4
