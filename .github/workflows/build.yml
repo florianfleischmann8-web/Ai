@@ -70,6 +70,7 @@ jobs:
               implementation("androidx.compose.animation:animation")
               implementation("androidx.compose.material3:material3")
               implementation("com.google.mlkit:image-labeling:17.0.9")
+              implementation("com.google.mlkit:face-detection:16.1.6")
           }
           __NF_EOF__
           mkdir -p app/src/main
@@ -155,7 +156,7 @@ jobs:
               var totalEp by mutableStateOf(0)
               var loss by mutableStateOf(0f)
               var preview by mutableStateOf<Bitmap?>(null)
-              var variation by mutableStateOf(0.35f)
+              var variation by mutableStateOf(0.25f)
               var toast by mutableStateOf<String?>(null)
               var draft by mutableStateOf("")
 
@@ -184,14 +185,22 @@ jobs:
 
               // ---------------- Bibliothek ----------------
 
-              fun addImages(uris: List<Uri>, tagText: String) {
+              fun addImages(uris: List<Uri>, tagText: String, faceZoom: Boolean = true) {
                   val tags = Lang.tokens(tagText)
+                  val wantFace = faceZoom && tags.any { it in Lang.faceWords }
                   viewModelScope.launch {
                       var skipped = 0
+                      var noFace = 0
                       val created = ArrayList<Item>()
                       for (u in uris) {
-                          val l = withContext(Dispatchers.IO) { try { Pix.load(ctx, u) } catch (e: Exception) { null } }
-                          if (l == null) { skipped++; continue }
+                          val loaded = withContext(Dispatchers.IO) { try { Pix.load(ctx, u) } catch (e: Exception) { null } }
+                          if (loaded == null) { skipped++; continue }
+                          var l: Loaded = loaded
+                          if (wantFace) {
+                              val crop = Vision.faceCrop(l.large)
+                              if (crop == null) { noFace++; continue }
+                              l = Loaded(Pix.prepare(crop), crop)
+                          }
                           val auto = autoTokens(Vision.labels(l.large)).entries
                               .sortedByDescending { it.value }.take(8).map { it.key to it.value }
                           if (tags.isEmpty() && auto.isEmpty()) { skipped++; continue }
@@ -201,8 +210,10 @@ jobs:
                       withContext(Dispatchers.IO) { store.persist(items.toList()) }
                       refreshAssoc()
                       latentsDirty = true
-                      toast = "${created.size} Bild(er) gelernt & automatisch erkannt" +
-                          (if (skipped > 0) " ($skipped übersprungen)" else "") + " – jetzt trainieren!"
+                      toast = "${created.size} Bild(er) gelernt" +
+                          (if (wantFace) " (auf Gesicht gezoomt)" else "") +
+                          (if (noFace > 0) ", $noFace ohne erkanntes Gesicht übersprungen" else "") +
+                          (if (skipped > 0) ", $skipped nicht lesbar" else "")
                   }
               }
 
@@ -443,17 +454,31 @@ jobs:
                       refreshLatents(snap)
                       val matched = snap.map { it to it.allTags.sumOf { t -> (weights[t] ?: 0f).toDouble() } }
                           .filter { it.second > 0.0 }.sortedByDescending { it.second }.map { it.first }
-                      val pool = (if (matched.isNotEmpty()) matched.take(8) else snap).toMutableList()
-                      java.util.Collections.shuffle(pool, rnd)
-                      val k = min(pool.size, 2 + rnd.nextInt(2))
-                      val w = FloatArray(k) { 0.25f + rnd.nextFloat() }
-                      val sw = w.sum()
-                      for (j in 0 until k) {
-                          val lat = latents[pool[j].id] ?: continue
-                          for (d in 0 until Cfg.Z) z[d] += lat[d] * w[j] / sw
+                      val lats = matched.take(60).mapNotNull { latents[it.id] }
+                      if (lats.size >= 6) {
+                          // genug Beispiele: neues Zufalls-Exemplar aus der gelernten Verteilung ziehen (z. B. ein neues Gesicht)
+                          for (d in 0 until Cfg.Z) {
+                              var mean = 0f
+                              for (l in lats) mean += l[d]
+                              mean /= lats.size
+                              var vr = 0f
+                              for (l in lats) vr += (l[d] - mean) * (l[d] - mean)
+                              val sd = kotlin.math.sqrt(vr / lats.size)
+                              z[d] = mean + sd * (0.4f + 1.2f * variation) * rnd.nextGaussian().toFloat()
+                          }
+                      } else {
+                          val pool = (if (matched.isNotEmpty()) matched.take(8) else snap).toMutableList()
+                          java.util.Collections.shuffle(pool, rnd)
+                          val k = min(pool.size, 2 + rnd.nextInt(2))
+                          val w = FloatArray(k) { 0.25f + rnd.nextFloat() }
+                          val sw = w.sum()
+                          for (j in 0 until k) {
+                              val lat = latents[pool[j].id] ?: continue
+                              for (d in 0 until Cfg.Z) z[d] += lat[d] * w[j] / sw
+                          }
+                          val noise = (if (matched.isEmpty()) 1.0f else 0.8f) * variation
+                          for (d in 0 until Cfg.Z) z[d] += (rnd.nextGaussian() * noise).toFloat()
                       }
-                      val noise = (if (matched.isEmpty()) 1.0f else 0.8f) * variation
-                      for (d in 0 until Cfg.Z) z[d] += (rnd.nextGaussian() * noise).toFloat()
                       model.decode(z, c)
                   }
                   val ints = IntArray(Cfg.S * Cfg.S)
@@ -600,6 +625,14 @@ jobs:
                   "will", "möchte", "kannst", "du", "the", "of", "draw", "make", "create", "generate", "image",
                   "picture", "me", "please", "show", "zeige", "zeig", "ein", "wie", "als", "bei", "ohne"
               )
+
+              val faceWords: Set<String> by lazy {
+                  listOf(
+                      "mensch", "gesicht", "person", "portrait", "porträt", "frau", "mann", "männlich", "weiblich",
+                      "kind", "face", "human", "man", "woman", "selfie", "kopf", "people", "girl", "boy", "baby",
+                      "junge", "mädchen"
+                  ).map { stem(it) }.toSet()
+              }
 
               fun stem(w: String): String {
                   for (suf in listOf("en", "er", "es", "e", "n", "s")) {
@@ -1444,14 +1477,15 @@ jobs:
                   TagDialog(
                       count = pending.size,
                       onCancel = { pending = emptyList() },
-                      onOk = { tags -> vm.addImages(pending, tags); pending = emptyList() }
+                      onOk = { tags, fz -> vm.addImages(pending, tags, fz); pending = emptyList() }
                   )
               }
           }
 
           @Composable
-          fun TagDialog(count: Int, onCancel: () -> Unit, onOk: (String) -> Unit) {
+          fun TagDialog(count: Int, onCancel: () -> Unit, onOk: (String, Boolean) -> Unit) {
               var tags by remember { mutableStateOf("") }
+              var face by remember { mutableStateOf(true) }
               val shape = RoundedCornerShape(14.dp)
               AlertDialog(
                   onDismissRequest = onCancel,
@@ -1462,16 +1496,30 @@ jobs:
                           T("Deine Stichwörter für alle gewählten Bilder (optional – die KI erkennt zusätzlich selbst, was darauf zu sehen ist):", P.dim, 13)
                           Spacer(Modifier.height(10.dp))
                           Box(Modifier.fillMaxWidth().clip(shape).background(P.card2).border(1.dp, P.line, shape).padding(12.dp)) {
-                              if (tags.isEmpty()) T("z. B. sonnenuntergang rot meer", P.dim, 14)
+                              if (tags.isEmpty()) T("z. B. mensch frau lächeln", P.dim, 14)
                               BasicTextField(
                                   value = tags, onValueChange = { tags = it },
                                   textStyle = TextStyle(color = P.text, fontSize = 15.sp),
                                   cursorBrush = SolidColor(P.cyan), modifier = Modifier.fillMaxWidth()
                               )
                           }
+                          Spacer(Modifier.height(10.dp))
+                          Row(
+                              Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { face = !face }.padding(vertical = 6.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Box(
+                                  Modifier.size(24.dp).clip(RoundedCornerShape(7.dp))
+                                      .background(if (face) P.grad else SolidColor(P.card2))
+                                      .border(1.dp, P.line, RoundedCornerShape(7.dp)),
+                                  contentAlignment = Alignment.Center
+                              ) { if (face) T("✓", Color.White, 14, FontWeight.Bold) }
+                              Spacer(Modifier.width(10.dp))
+                              T("🔍 Auf das Gesicht zoomen (bei Stichwörtern wie mensch, gesicht, frau, mann, kind …)", P.dim, 12)
+                          }
                       }
                   },
-                  confirmButton = { Pill("Hinzufügen", true) { onOk(tags) } },
+                  confirmButton = { Pill("Hinzufügen", true) { onOk(tags, face) } },
                   dismissButton = { Pill("Abbrechen") { onCancel() } }
               )
           }
@@ -1578,15 +1626,26 @@ jobs:
 
           import android.graphics.Bitmap
           import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetectorOptions
           import com.google.mlkit.vision.label.ImageLabeling
           import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
           import kotlinx.coroutines.suspendCancellableCoroutine
           import kotlin.coroutines.resume
+          import kotlin.math.max
+          import kotlin.math.min
 
-          /** Erkennt on-device (Modell steckt in der APK, kein Internet, keine API), was auf einem Bild zu sehen ist. */
+          /** Bilderkennung on-device (Modelle stecken in der APK, kein Internet, keine API). */
           object Vision {
               private val labeler by lazy {
                   ImageLabeling.getClient(ImageLabelerOptions.Builder().setConfidenceThreshold(0.55f).build())
+              }
+              private val faceDetector by lazy {
+                  FaceDetection.getClient(
+                      FaceDetectorOptions.Builder()
+                          .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                          .build()
+                  )
               }
 
               suspend fun labels(bmp: Bitmap): List<Pair<String, Float>> = suspendCancellableCoroutine { cont ->
@@ -1596,6 +1655,33 @@ jobs:
                           .addOnFailureListener { cont.resume(emptyList()) }
                   } catch (e: Exception) {
                       cont.resume(emptyList())
+                  }
+              }
+
+              /** Schneidet das groesste Gesicht quadratisch (mit etwas Rand) aus. Null, wenn kein Gesicht gefunden wurde. */
+              suspend fun faceCrop(bmp: Bitmap): Bitmap? = suspendCancellableCoroutine<Bitmap?> { cont ->
+                  try {
+                      faceDetector.process(InputImage.fromBitmap(bmp, 0))
+                          .addOnSuccessListener { faces ->
+                              val f = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                              if (f == null) {
+                                  cont.resume(null)
+                              } else {
+                                  val r = f.boundingBox
+                                  var side = (max(r.width(), r.height()) * 1.45f).toInt()
+                                  side = min(side, min(bmp.width, bmp.height))
+                                  if (side < 16) {
+                                      cont.resume(null)
+                                  } else {
+                                      val x = (r.centerX() - side / 2).coerceIn(0, bmp.width - side)
+                                      val y = (r.centerY() - side / 2).coerceIn(0, bmp.height - side)
+                                      cont.resume(Bitmap.createBitmap(bmp, x, y, side, side))
+                                  }
+                              }
+                          }
+                          .addOnFailureListener { cont.resume(null) }
+                  } catch (e: Exception) {
+                      cont.resume(null)
                   }
               }
           }
